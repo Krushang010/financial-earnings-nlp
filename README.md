@@ -40,7 +40,7 @@ The project was built primarily to understand the **complete NLP pipeline undern
 
 > Streamlit deployment will be added here after deployment.
 
-**Live Demo:** `Coming Soon`
+**Live Demo:** `https://financial-earnings-nlp.streamlit.app/`
 
 **GitHub Repository:** `https://github.com/Krushang010/financial-earnings-nlp.git`
 
@@ -48,7 +48,7 @@ The project was built primarily to understand the **complete NLP pipeline undern
 
 ## 🖼️ Application Preview
 
-> Add screenshots here after the Streamlit application is deployed.
+> ![img.png](img.png)
 
 Recommended screenshots:
 
