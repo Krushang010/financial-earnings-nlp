@@ -4,3 +4,4 @@ transformers==5.17.0
 spacy==3.8.16
 pandas==3.0.6
 pymupdf==1.28.2
+huggingface_hub==1.33.0

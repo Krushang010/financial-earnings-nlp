@@ -1,315 +1,258 @@
+import os
+import re
 from functools import lru_cache
 
-import spacy
-import torch
-from transformers import (
-    AutoTokenizer,
-    AutoModelForSeq2SeqLM
-)
+from huggingface_hub import InferenceClient
+from transformers import AutoTokenizer
 
 
-SUMMARY_MODEL = "sshleifer/distilbart-cnn-12-6"
+MODEL_NAME = "sshleifer/distilbart-cnn-12-6"
 
-DEVICE = torch.device(
-    "cuda" if torch.cuda.is_available() else "cpu"
-)
-
-
-# =========================================================
-# MODEL LOADERS
-# =========================================================
-
-@lru_cache(maxsize=1)
-def load_spacy():
-    """
-    Lightweight spaCy pipeline used only for
-    sentence segmentation.
-    """
-
-    nlp = spacy.blank("en")
-
-    nlp.add_pipe(
-        "sentencizer"
-    )
-
-    nlp.max_length = 3_000_000
-
-    return nlp
+MAX_CHUNK_TOKENS = 700
 
 
 @lru_cache(maxsize=1)
-def load_summarizer():
+def load_tokenizer():
     """
-    Load DistilBART tokenizer and summarization model once.
+    Load only the tokenizer locally.
+
+    The DistilBART model itself is NOT loaded into Streamlit RAM.
+    """
+    return AutoTokenizer.from_pretrained(MODEL_NAME)
+
+
+@lru_cache(maxsize=1)
+def get_inference_client():
+    """
+    Create Hugging Face Inference client.
+
+    HF_TOKEN is stored in Streamlit Secrets.
+    Root-level Streamlit secrets are exposed as environment variables.
     """
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        SUMMARY_MODEL
+    token = os.getenv("HF_TOKEN")
+
+    if not token:
+        raise RuntimeError(
+            "HF_TOKEN is missing. Add it to Streamlit Secrets."
+        )
+
+    return InferenceClient(
+        provider="hf-inference",
+        api_key=token,
     )
 
-    model = AutoModelForSeq2SeqLM.from_pretrained(
-        SUMMARY_MODEL
-    )
 
-    # IMPORTANT:
-    # Generation settings belong in generation_config,
-    # NOT model.config.
-    model.generation_config.forced_bos_token_id = 0
-
-    model.eval()
-
-    return tokenizer, model
-
-
-# =========================================================
-# SENTENCE SEGMENTATION
-# =========================================================
-
-def extract_sentences(text: str) -> list[str]:
-
-    nlp = load_spacy()
-
-    doc = nlp(text)
-
-    return [
-        sentence.text.strip()
-        for sentence in doc.sents
-        if sentence.text.strip()
-    ]
-
-
-# =========================================================
-# TOKEN COUNTING
-# =========================================================
-
-def count_tokens(
-    text: str,
-    tokenizer
-) -> int:
-    """
-    Safe token counting without tokenizer.encode()
-    maximum-length warnings.
-    """
+def token_count(text: str) -> int:
+    tokenizer = load_tokenizer()
 
     return len(
-        tokenizer.tokenize(text)
+        tokenizer.encode(
+            text,
+            add_special_tokens=False,
+        )
     )
 
 
-# =========================================================
-# TOKEN-AWARE CHUNKING
-# =========================================================
+def split_sentences(text: str) -> list[str]:
+    """
+    Lightweight sentence splitting for summarization chunking.
+    """
 
-def chunk_text_by_tokens(
-    texts: list[str],
-    tokenizer,
-    max_tokens: int = 700
+    text = re.sub(r"\s+", " ", text).strip()
+
+    if not text:
+        return []
+
+    return re.split(
+        r"(?<=[.!?])\s+",
+        text,
+    )
+
+
+def create_chunks(
+    text: str,
+    max_tokens: int = MAX_CHUNK_TOKENS,
 ) -> list[str]:
+
+    tokenizer = load_tokenizer()
+
+    sentences = split_sentences(text)
 
     chunks = []
 
-    current_chunk = []
+    current_sentences = []
     current_tokens = 0
 
-    for text in texts:
+    for sentence in sentences:
 
-        token_count = count_tokens(
-            text,
-            tokenizer
+        sentence_tokens = len(
+            tokenizer.encode(
+                sentence,
+                add_special_tokens=False,
+            )
         )
 
+        # Handle unusually long individual sentences
+        if sentence_tokens > max_tokens:
+
+            if current_sentences:
+                chunks.append(
+                    " ".join(current_sentences)
+                )
+
+                current_sentences = []
+                current_tokens = 0
+
+            encoded = tokenizer.encode(
+                sentence,
+                add_special_tokens=False,
+            )
+
+            for start in range(
+                0,
+                len(encoded),
+                max_tokens,
+            ):
+
+                part = encoded[
+                    start:start + max_tokens
+                ]
+
+                chunks.append(
+                    tokenizer.decode(
+                        part,
+                        skip_special_tokens=True,
+                    )
+                )
+
+            continue
+
         if (
-            current_chunk
-            and
-            current_tokens + token_count > max_tokens
+            current_tokens + sentence_tokens
+            > max_tokens
         ):
 
             chunks.append(
-                " ".join(current_chunk)
+                " ".join(current_sentences)
             )
 
-            current_chunk = []
-            current_tokens = 0
+            current_sentences = [sentence]
+            current_tokens = sentence_tokens
 
-        current_chunk.append(text)
-        current_tokens += token_count
+        else:
 
-    if current_chunk:
+            current_sentences.append(sentence)
+            current_tokens += sentence_tokens
 
+    if current_sentences:
         chunks.append(
-            " ".join(current_chunk)
+            " ".join(current_sentences)
         )
 
     return chunks
 
 
-# =========================================================
-# SINGLE CHUNK SUMMARIZATION
-# =========================================================
+def summarize_chunk(text: str) -> str:
+    """
+    Summarize one chunk remotely using Hugging Face Inference.
+    """
 
-def summarize_chunk(
-    text: str,
-    tokenizer,
-    model,
-    max_input_tokens: int = 800,
-    max_summary_tokens: int = 150,
-    min_summary_tokens: int = 40
-) -> str:
+    client = get_inference_client()
 
-    inputs = tokenizer(
+    result = client.summarization(
         text,
-        return_tensors="pt",
-        truncation=True,
-        max_length=max_input_tokens
+        model=MODEL_NAME,
     )
 
-    inputs = {
-        key: value.to(DEVICE)
-        for key, value in inputs.items()
-    }
+    # huggingface_hub may return an object
+    if hasattr(result, "summary_text"):
+        return result.summary_text.strip()
 
-    with torch.inference_mode():
+    return str(result).strip()
 
-        summary_ids = model.generate(
-            **inputs,
-            max_length=max_summary_tokens,
-            min_length=min_summary_tokens,
-            num_beams=4,
-            early_stopping=True,
-            no_repeat_ngram_size=3
-        )
-
-    summary = tokenizer.decode(
-        summary_ids[0],
-        skip_special_tokens=True
-    )
-
-    return summary.strip()
-
-
-# =========================================================
-# HIERARCHICAL SUMMARIZATION
-# =========================================================
 
 def generate_executive_summary(
-    text: str
+    transcript: str,
 ) -> str:
+    """
+    Hierarchical summarization.
 
-    tokenizer, model = load_summarizer()
+    Transcript
+        ↓
+    chunks
+        ↓
+    remote DistilBART summaries
+        ↓
+    recursive reduction
+        ↓
+    final executive summary
+    """
 
-    model = model.to(DEVICE)
+    if not transcript.strip():
+        return ""
 
-    try:
+    chunks = create_chunks(transcript)
 
-        sentences = extract_sentences(
-            text
-        )
+    if not chunks:
+        return ""
 
-        if not sentences:
-            return ""
+    summaries = []
 
+    for chunk in chunks:
+        summary = summarize_chunk(chunk)
 
-        # -------------------------------------------------
-        # LEVEL 1
-        # -------------------------------------------------
-
-        level1_chunks = chunk_text_by_tokens(
-            sentences,
-            tokenizer,
-            max_tokens=700
-        )
-
-        summaries = []
-
-        for chunk in level1_chunks:
-
-            summary = summarize_chunk(
-                text=chunk,
-                tokenizer=tokenizer,
-                model=model,
-                max_input_tokens=800,
-                max_summary_tokens=130,
-                min_summary_tokens=40
-            )
-
+        if summary:
             summaries.append(summary)
 
+    if not summaries:
+        return ""
 
-        # -------------------------------------------------
-        # RECURSIVE REDUCTION
-        # -------------------------------------------------
+    combined = " ".join(summaries)
 
-        while True:
+    # Recursive reduction if summaries are still too long
+    max_rounds = 4
 
-            combined = " ".join(
-                summaries
-            )
+    rounds = 0
 
-            combined_token_count = (
-                count_tokens(
-                    combined,
-                    tokenizer
-                )
-            )
+    while (
+        token_count(combined) > MAX_CHUNK_TOKENS
+        and rounds < max_rounds
+    ):
 
-            if combined_token_count <= 700:
-                break
+        chunks = create_chunks(combined)
 
-            grouped_summaries = (
-                chunk_text_by_tokens(
-                    summaries,
-                    tokenizer,
-                    max_tokens=700
-                )
-            )
+        reduced = []
 
-            next_level_summaries = []
+        for chunk in chunks:
+            summary = summarize_chunk(chunk)
 
-            for group in grouped_summaries:
+            if summary:
+                reduced.append(summary)
 
-                reduced_summary = (
-                    summarize_chunk(
-                        text=group,
-                        tokenizer=tokenizer,
-                        model=model,
-                        max_input_tokens=800,
-                        max_summary_tokens=180,
-                        min_summary_tokens=60
-                    )
-                )
+        if not reduced:
+            break
 
-                next_level_summaries.append(
-                    reduced_summary
-                )
+        new_combined = " ".join(reduced)
 
-            summaries = (
-                next_level_summaries
-            )
+        # Safety: avoid infinite recursion
+        if len(new_combined) >= len(combined):
+            break
 
+        combined = new_combined
 
-        # -------------------------------------------------
-        # FINAL SUMMARY
-        # -------------------------------------------------
+        rounds += 1
 
-        final_input = " ".join(
-            summaries
-        )
+    # One final compression if needed
+    if token_count(combined) <= MAX_CHUNK_TOKENS:
 
-        final_summary = summarize_chunk(
-            text=final_input,
-            tokenizer=tokenizer,
-            model=model,
-            max_input_tokens=800,
-            max_summary_tokens=220,
-            min_summary_tokens=90
-        )
+        try:
+            final_summary = summarize_chunk(combined)
 
-        return final_summary
+            if final_summary:
+                return final_summary
 
+        except Exception:
+            pass
 
-    finally:
-
-        model.to("cpu")
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    return combined
