@@ -1,32 +1,40 @@
 # Virtual environment
 .venv/
+venv/
 
-# Python cache
+# Python
 __pycache__/
 *.py[cod]
 
 # Jupyter
 .ipynb_checkpoints/
 
-# IDE
-.vscode/
-.idea/
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# Raw transcript PDFs
+# Raw/private data
 data/raw/*.pdf
 
-# Processed/generated data
+# Generated processed data
 data/processed/*
 !data/processed/.gitkeep
 
-# Model artifacts
+# Generated outputs
+outputs/*
+!outputs/.gitkeep
+
+# Model/cache files
 models/
 *.pkl
 *.joblib
 
+# Hugging Face / model caches
+.cache/
+huggingface/
+
+# IDE
+.idea/
+
 # Logs
-logs/
+*.log
+
+# Environment / secrets
+.env
+.streamlit/secrets.toml
